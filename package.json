@@ -1,7 +1,7 @@
 {
   "name": "mini-qr",
   "private": true,
-  "version": "0.13.1",
+  "version": "0.30.2",
   "type": "module",
   "packageManager": "pnpm@10.0.0",
   "scripts": {
@@ -16,9 +16,9 @@
     "lint": "eslint . --fix",
     "format": "prettier --write",
     "postinstall": "husky install",
-    "generate-changelog": "bash scripts/generate-version.sh",
     "generate-splash": "node scripts/generate-splash-screens.js",
-    "sync-i18n": "node scripts/sync-i18n.mjs"
+    "sync-i18n": "node scripts/sync-i18n.mjs",
+    "translate:deepl": "node scripts/translate-deepl.mjs"
   },
   "lint-staged": {
     "*.{vue,js,jsx,ts,tsx,json}": [
