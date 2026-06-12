@@ -11,6 +11,7 @@ import {
   AccordionTrigger
 } from '@/components/ui/accordion'
 import { Combobox } from '@/components/ui/Combobox'
+import QRSimpleFieldsCustomizer from '@/components/QRSimpleFieldsCustomizer.vue'
 import {
   Drawer,
   DrawerContent,
@@ -58,11 +59,23 @@ import {
   LAST_LOADED_LOCALLY_PRESET_KEY,
   LOADED_FROM_FILE_PRESET_KEY,
   loadQRConfig,
+  loadSimpleFields,
+  loadViewMode,
   saveQRConfig,
+  saveSimpleFields,
+  saveViewMode,
   serializeQRConfig,
   type QRCodeConfig,
   type QRCodeFrameConfig
 } from '@/utils/useQRCodeStorage'
+import {
+  FRAME_FIELD_KEYS,
+  isFieldVisibleInMode,
+  parseVisibleFields,
+  hasFrameField,
+  type QRViewMode,
+  type SimpleFieldKey
+} from '@/utils/simpleModeFields'
 import { useMediaQuery } from '@vueuse/core'
 import JSZip from 'jszip'
 import TextExportModal from '@/components/TextExportModal.vue'
@@ -74,7 +87,7 @@ import {
   type ErrorCorrectionLevel,
   type Options as StyledQRCodeProps
 } from '@/lib/qr-code'
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import 'vue-i18n'
 import { useI18n } from 'vue-i18n'
 
@@ -87,6 +100,126 @@ const isLarge = useMediaQuery('(min-width: 768px)')
 const isLikelyMobileDevice = computed(() => {
   return typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0
 })
+
+//#region /** Simple Mode */
+// Full mode shows every setting (current behavior). Simple mode shows only the
+// data field plus whichever fields the user pins via the customize panel. Both
+// the mode and the pinned-field list persist to localStorage so a refresh
+// returns the user to the same view (see onMounted + watchers below).
+
+// Deployment config (build-time env vars):
+// - VITE_QR_CREATE_SIMPLE_FULL_MODE_TOGGLE: when "true", show the Simple/Full
+//   toggle and the Customize fields button. Hidden by default so self-hosted
+//   deployments are not exposed to the controls unless opted in.
+// - VITE_FIELDS_VISIBLE: comma/space separated field keys. When set, the app
+//   starts in Simple mode showing only those fields (a fixed, simplified view).
+const showModeControls = import.meta.env.VITE_QR_CREATE_SIMPLE_FULL_MODE_TOGGLE === 'true'
+const configuredVisibleFields = parseVisibleFields(import.meta.env.VITE_FIELDS_VISIBLE)
+const hasConfiguredVisibleFields = configuredVisibleFields.length > 0
+
+const viewMode = ref<QRViewMode>(hasConfiguredVisibleFields ? 'simple' : 'full')
+const simpleFields = ref<SimpleFieldKey[]>(
+  hasConfiguredVisibleFields ? [...configuredVisibleFields] : []
+)
+const isCustomizeFieldsOpen = ref(false)
+const isSimpleMode = computed(() => viewMode.value === 'simple')
+
+// Controls which accordion sections are expanded. Both modes show the section
+// headers. We keep hidden sections OUT of the open set: otherwise a section
+// that is display:none but "open" would reveal and play its collapse animation
+// at the same time when switching simple → full, causing a visible flash.
+const openAccordionItems = ref<string[]>(['qr-code-settings'])
+
+function isFieldVisible(key: SimpleFieldKey): boolean {
+  return isFieldVisibleInMode(viewMode.value, simpleFields.value, key)
+}
+
+/** Whether an accordion group should render at all in the current mode. */
+function isGroupVisible(keys: readonly SimpleFieldKey[]): boolean {
+  return viewMode.value === 'full' || keys.some((k) => simpleFields.value.includes(k))
+}
+
+// The frame accordion section appears in simple mode when at least one frame
+// field is pinned, or when the frame is enabled (so it stays manageable).
+const isFrameSectionVisible = computed(() => isGroupVisible(FRAME_FIELD_KEYS) || showFrame.value)
+
+// Auto-open the frame section in simple mode once it becomes visible, and drop
+// it from the open set whenever it is hidden. (Not immediate — showFrame is
+// declared later, and the initial full-mode default is already correct.)
+watch(isFrameSectionVisible, (visible) => {
+  if (!visible) {
+    openAccordionItems.value = openAccordionItems.value.filter((i) => i !== 'frame-settings')
+  } else if (isSimpleMode.value && !openAccordionItems.value.includes('frame-settings')) {
+    openAccordionItems.value = ['frame-settings', ...openAccordionItems.value]
+  }
+})
+
+watch(isSimpleMode, (simple) => {
+  if (simple) {
+    // Open only the sections that are actually visible.
+    openAccordionItems.value = isFrameSectionVisible.value
+      ? ['frame-settings', 'qr-code-settings']
+      : ['qr-code-settings']
+  } else if (!openAccordionItems.value.includes('qr-code-settings')) {
+    // Entering full mode keeps whatever was open (no collapse flash); just
+    // ensure the QR section stays available.
+    openAccordionItems.value = [...openAccordionItems.value, 'qr-code-settings']
+  }
+})
+
+function setViewMode(mode: QRViewMode): void {
+  if (mode !== viewMode.value) triggerModeAnimation()
+  viewMode.value = mode
+}
+
+// On mobile the export/preview lives in a fixed bottom sheet that overlaps the
+// scrollable settings. Track its height so we can pad the bottom of the
+// settings column and let its last items scroll clear of the sheet.
+// Default reflects a typical sheet height so the padding is correct on the very
+// first render (avoids needing a second scroll); the observer then refines it.
+const DEFAULT_EXPORT_SHEET_HEIGHT = 220
+const exportSheetHeight = ref(DEFAULT_EXPORT_SHEET_HEIGHT)
+let exportSheetObserver: ResizeObserver | undefined
+function observeExportSheet(attempt = 0): void {
+  if (typeof ResizeObserver === 'undefined') return
+  exportSheetObserver?.disconnect()
+  const el = document.getElementById('drawer-preview-container')
+  if (!el) {
+    // The bottom sheet (vaul drawer trigger) can mount a tick after us; retry
+    // briefly while we're on a mobile layout.
+    if (!isLarge.value && attempt < 8) setTimeout(() => observeExportSheet(attempt + 1), 100)
+    return
+  }
+  exportSheetObserver = new ResizeObserver(() => {
+    const h = el.getBoundingClientRect().height
+    if (h > 0) exportSheetHeight.value = h
+  })
+  exportSheetObserver.observe(el)
+  const h = el.getBoundingClientRect().height
+  if (h > 0) exportSheetHeight.value = h
+}
+// The bottom sheet only exists on mobile; re-attach when the layout switches.
+watch(isLarge, () => nextTick(() => observeExportSheet()))
+onMounted(() => nextTick(() => observeExportSheet()))
+onUnmounted(() => exportSheetObserver?.disconnect())
+
+// Extra bottom padding (mobile only) so settings can scroll above the sheet.
+const settingsBottomPadding = computed(() =>
+  isLarge.value ? undefined : `${Math.round(exportSheetHeight.value) + 24}px`
+)
+
+// Briefly flag the settings container so visible `.field-reveal` blocks play
+// their slide-in animation when the user switches modes.
+const isModeAnimating = ref(false)
+let modeAnimationTimer: ReturnType<typeof setTimeout> | undefined
+function triggerModeAnimation(): void {
+  isModeAnimating.value = true
+  clearTimeout(modeAnimationTimer)
+  modeAnimationTimer = setTimeout(() => {
+    isModeAnimating.value = false
+  }, 300)
+}
+//#endregion
 
 //#region /** locale */
 const { t, locale } = useI18n()
@@ -846,6 +979,19 @@ watch(
   { deep: true }
 )
 
+// Persist Simple Mode preferences independently of the QR config so toggling
+// the view never rewrites the stored design.
+watch(viewMode, (mode) => {
+  if (isLocalStorageEnabled()) saveViewMode(mode)
+})
+watch(
+  simpleFields,
+  (fields) => {
+    if (isLocalStorageEnabled()) saveSimpleFields(fields)
+  },
+  { deep: true }
+)
+
 onMounted(() => {
   if (isLocalStorageEnabled()) {
     const storedConfig = loadQRConfig()
@@ -855,6 +1001,31 @@ onMounted(() => {
       selectedPreset.value = { ...defaultPreset }
       selectedPresetKey.value = defaultPreset.name
     }
+    // When the deployment fixes the visible fields via env, that config is
+    // authoritative — don't let a previously persisted view/fields override it.
+    if (!hasConfiguredVisibleFields) {
+      viewMode.value = loadViewMode() ?? 'full'
+      simpleFields.value = loadSimpleFields()
+    }
+  }
+
+  // Env-configured fields force a simple, fixed view.
+  if (hasConfiguredVisibleFields) {
+    viewMode.value = 'simple'
+    simpleFields.value = [...configuredVisibleFields]
+    // Run after the preset watchers settle (applySelectedPresetToState resets
+    // showFrame for frameless presets), so our overrides stick. Enable the
+    // frame when a frame field is configured, and open the visible sections
+    // explicitly — we start in simple mode so the open-state watchers never
+    // fire on their own.
+    nextTick(() => {
+      if (hasFrameField(configuredVisibleFields)) {
+        showFrame.value = true
+      }
+      openAccordionItems.value = isFrameSectionVisible.value
+        ? ['frame-settings', 'qr-code-settings']
+        : ['qr-code-settings']
+    })
   }
 
   // Apply frame preset when QR preset does not define a frame
@@ -1152,7 +1323,7 @@ const updateDataFromModal = (newData: string) => {
       v-if="isLarge"
       ref="mainContentContainer"
       id="main-content-container"
-      class="sticky top-0 flex w-full shrink-0 flex-col items-center justify-center p-4 md:w-fit"
+      class="sticky top-0 flex max-h-[calc(100vh-6.5rem)] w-full shrink-0 flex-col items-center justify-start overflow-y-auto p-4 md:w-fit"
     ></div>
     <!-- Bottom sheet on small screens -->
     <Drawer v-else v-model:open="isMobileExportDrawerOpen">
@@ -1340,8 +1511,8 @@ const updateDataFromModal = (newData: string) => {
             />
           </div>
         </div>
-        <div class="mt-4 flex flex-col items-center gap-8">
-          <div class="flex flex-col items-center justify-center gap-3">
+        <div class="mt-3 flex flex-col items-center gap-4">
+          <div class="flex flex-col items-center justify-center gap-2">
             <button
               v-if="exportMode !== ExportMode.Batch"
               id="copy-qr-image-button"
@@ -1385,10 +1556,9 @@ const updateDataFromModal = (newData: string) => {
                   stroke-width="2"
                 >
                   <path d="M14 3v4a1 1 0 0 0 1 1h4" />
-                  <path
-                    d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2zm-5-4v-6"
-                  />
-                  <path d="M9.5 13.5L12 11l2.5 2.5" />
+                  <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                  <path d="M12 11v6" />
+                  <path d="M9.5 14.5L12 17l2.5-2.5" />
                 </g>
               </svg>
               <p>{{ t('Save QR Code configuration') }}</p>
@@ -1408,9 +1578,8 @@ const updateDataFromModal = (newData: string) => {
                   stroke-width="2"
                 >
                   <path d="M14 3v4a1 1 0 0 0 1 1h4" />
-                  <path
-                    d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2zm-5-10v6"
-                  />
+                  <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                  <path d="M12 17v-6" />
                   <path d="M9.5 13.5L12 11l2.5 2.5" />
                 </g>
               </svg>
@@ -1581,7 +1750,7 @@ const updateDataFromModal = (newData: string) => {
             </div>
           </section>
 
-          <div class="mt-4 hidden flex-wrap items-center justify-center gap-2 md:flex">
+          <div class="mt-2 hidden flex-wrap items-center justify-center gap-2 md:flex">
             <a
               href="https://github.com/lyqht/mini-qr/discussions"
               target="_blank"
@@ -1633,15 +1802,97 @@ const updateDataFromModal = (newData: string) => {
       </div>
     </Teleport>
 
-    <section id="settings" class="flex w-full grow flex-col items-start gap-8 text-start">
+    <section
+      id="settings"
+      class="flex w-full grow flex-col items-start gap-8 text-start"
+      :class="{ 'mode-animating': isModeAnimating }"
+      :style="{ paddingBottom: settingsBottomPadding }"
+    >
       <h2 class="sr-only">{{ t('Settings to customize your QR code') }}</h2>
+
+      <!-- View mode toggle: Simple shows only the data field plus pinned
+           fields; Full shows every setting. Sits at the top of the settings
+           column so it is reachable on both desktop and (stacked) mobile.
+           Hidden unless VITE_QR_CREATE_SIMPLE_FULL_MODE_TOGGLE is enabled. -->
+      <div v-if="showModeControls" class="flex w-full flex-col gap-3">
+        <div
+          class="flex flex-row flex-wrap items-center gap-2"
+          role="group"
+          :aria-label="t('Configuration view mode')"
+        >
+          <div
+            class="inline-flex rounded-lg border border-zinc-300 p-1 dark:border-zinc-700"
+            role="radiogroup"
+            :aria-label="t('Configuration view mode')"
+          >
+            <button
+              id="view-mode-simple"
+              type="button"
+              role="radio"
+              :aria-checked="isSimpleMode"
+              class="rounded-md px-3 py-1 text-sm font-medium transition-colors"
+              :class="
+                isSimpleMode
+                  ? 'bg-zinc-200 text-gray-900 dark:bg-zinc-700 dark:text-gray-100'
+                  : 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'
+              "
+              @click="setViewMode('simple')"
+            >
+              {{ t('Simple') }}
+            </button>
+            <button
+              id="view-mode-full"
+              type="button"
+              role="radio"
+              :aria-checked="!isSimpleMode"
+              class="rounded-md px-3 py-1 text-sm font-medium transition-colors"
+              :class="
+                !isSimpleMode
+                  ? 'bg-zinc-200 text-gray-900 dark:bg-zinc-700 dark:text-gray-100'
+                  : 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'
+              "
+              @click="setViewMode('full')"
+            >
+              {{ t('Full') }}
+            </button>
+          </div>
+          <button
+            v-if="isSimpleMode"
+            id="customize-fields-button"
+            type="button"
+            class="button flex flex-row items-center gap-1 text-sm"
+            @click="isCustomizeFieldsOpen = true"
+          >
+            <!-- Icon from Tabler Icons by Paweł Kuna -->
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24">
+              <g
+                fill="none"
+                stroke="currentColor"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+              >
+                <path d="M4 6h8M16 6h4M4 12h4M12 12h8M4 18h12M18 18h2" />
+                <circle cx="14" cy="6" r="2" />
+                <circle cx="10" cy="12" r="2" />
+                <circle cx="16" cy="18" r="2" />
+              </g>
+            </svg>
+            <span>{{ t('Customize fields') }}</span>
+          </button>
+        </div>
+        <p v-if="isSimpleMode" class="text-sm text-gray-500 dark:text-gray-400">
+          {{ t('Showing only the fields you use. Customize to show more.') }}
+        </p>
+      </div>
+
       <Accordion
+        v-model="openAccordionItems"
         type="multiple"
         collapsible
         class="flex w-full flex-col gap-4"
-        :default-value="['qr-code-settings']"
       >
-        <AccordionItem value="frame-settings">
+        <AccordionItem v-show="isFrameSectionVisible" value="frame-settings">
           <AccordionTrigger
             class="button !px-4 text-2xl text-gray-700 outline-none dark:text-gray-100 md:!px-6 lg:!px-8"
             ><span id="frame-settings-title">{{ t('Frame settings') }}</span></AccordionTrigger
@@ -1654,7 +1905,10 @@ const updateDataFromModal = (newData: string) => {
               </div>
 
               <template v-if="showFrame">
-                <div class="flex flex-col sm:flex-row sm:items-center sm:gap-8">
+                <div
+                  class="field-reveal flex flex-col sm:flex-row sm:items-center sm:gap-8"
+                  v-show="isFieldVisible('framePreset')"
+                >
                   <div class="flex flex-col sm:w-1/2">
                     <label>{{ t('Frame preset') }}</label>
                     <Combobox
@@ -1664,9 +1918,12 @@ const updateDataFromModal = (newData: string) => {
                     />
                   </div>
                 </div>
-                <fieldset class="flex flex-col gap-4">
+                <fieldset
+                  class="field-reveal flex flex-col gap-4"
+                  v-show="isGroupVisible(['frameText', 'framePosition'])"
+                >
                   <legend class="mb-2 block">{{ t('Caption') }}</legend>
-                  <div>
+                  <div v-show="isFieldVisible('frameText')">
                     <label for="frame-text" class="mb-2 block text-sm">{{ t('Text') }}</label>
                     <textarea
                       name="frame-text"
@@ -1677,7 +1934,7 @@ const updateDataFromModal = (newData: string) => {
                       v-model="frameText"
                     />
                   </div>
-                  <fieldset>
+                  <fieldset v-show="isFieldVisible('framePosition')">
                     <legend class="mb-2 block text-sm">{{ t('Position') }}</legend>
                     <div
                       class="radio"
@@ -1694,10 +1951,29 @@ const updateDataFromModal = (newData: string) => {
                     </div>
                   </fieldset>
                 </fieldset>
-                <div>
+                <div
+                  class="field-reveal"
+                  v-show="
+                    isGroupVisible([
+                      'frameWidth',
+                      'frameTextColor',
+                      'frameBackground',
+                      'frameBorderColor',
+                      'frameBorderWidth',
+                      'frameBorderRadius',
+                      'framePadding',
+                      'frameFontFamily'
+                    ])
+                  "
+                >
                   <label class="mb-2 block">{{ t('Frame style') }}</label>
                   <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                    <div v-if="frameTextPosition === 'left' || frameTextPosition === 'right'">
+                    <div
+                      v-if="
+                        isFieldVisible('frameWidth') &&
+                        (frameTextPosition === 'left' || frameTextPosition === 'right')
+                      "
+                    >
                       <label for="frame-width" class="mb-1 block text-sm">{{
                         t('Frame width')
                       }}</label>
@@ -1725,7 +2001,7 @@ const updateDataFromModal = (newData: string) => {
                         }}
                       </p>
                     </div>
-                    <div>
+                    <div v-show="isFieldVisible('frameTextColor')">
                       <label for="frame-text-color" class="mb-1 block text-sm">{{
                         t('Text color')
                       }}</label>
@@ -1736,7 +2012,7 @@ const updateDataFromModal = (newData: string) => {
                         v-model="frameStyle.textColor"
                       />
                     </div>
-                    <fieldset>
+                    <fieldset v-show="isFieldVisible('frameBackground')">
                       <legend class="mb-1 block text-sm">{{ t('Background') }}</legend>
                       <div class="flex flex-row items-center gap-4">
                         <div class="radio">
@@ -1802,7 +2078,7 @@ const updateDataFromModal = (newData: string) => {
                         />
                       </div>
                     </fieldset>
-                    <div>
+                    <div v-show="isFieldVisible('frameBorderColor')">
                       <label for="frame-border-color" class="mb-1 block text-sm">{{
                         t('Border color')
                       }}</label>
@@ -1813,7 +2089,7 @@ const updateDataFromModal = (newData: string) => {
                         v-model="frameStyle.borderColor"
                       />
                     </div>
-                    <div>
+                    <div v-show="isFieldVisible('frameBorderWidth')">
                       <label for="frame-border-width" class="mb-1 block text-sm">{{
                         t('Border width')
                       }}</label>
@@ -1825,7 +2101,7 @@ const updateDataFromModal = (newData: string) => {
                         placeholder="1px"
                       />
                     </div>
-                    <div>
+                    <div v-show="isFieldVisible('frameBorderRadius')">
                       <label for="frame-border-radius" class="mb-1 block text-sm">{{
                         t('Border radius')
                       }}</label>
@@ -1837,7 +2113,7 @@ const updateDataFromModal = (newData: string) => {
                         placeholder="8px"
                       />
                     </div>
-                    <div>
+                    <div v-show="isFieldVisible('framePadding')">
                       <label for="frame-padding" class="mb-1 block text-sm">{{
                         t('Padding')
                       }}</label>
@@ -1849,7 +2125,7 @@ const updateDataFromModal = (newData: string) => {
                         placeholder="16px"
                       />
                     </div>
-                    <div class="sm:col-span-2">
+                    <div class="sm:col-span-2" v-show="isFieldVisible('frameFontFamily')">
                       <label for="frame-font-family" class="mb-1 block text-sm">{{
                         t('Font family')
                       }}</label>
@@ -1896,7 +2172,7 @@ const updateDataFromModal = (newData: string) => {
           >
           <AccordionContent class="px-2 pb-8 pt-4">
             <section class="w-full space-y-4" aria-labelledby="qr-code-settings-title">
-              <div>
+              <div class="field-reveal" v-show="isFieldVisible('preset')">
                 <label>{{ t('Preset') }}</label>
                 <div class="flex flex-row items-center justify-start gap-2">
                   <Combobox
@@ -2138,7 +2414,7 @@ const updateDataFromModal = (newData: string) => {
                   </div>
                 </div>
               </div>
-              <div class="w-full">
+              <div class="field-reveal w-full" v-show="isFieldVisible('logoImage')">
                 <div class="mb-2 flex flex-row items-center gap-2">
                   <label for="image-url">
                     {{ t('Logo image URL') }}
@@ -2176,14 +2452,30 @@ const updateDataFromModal = (newData: string) => {
                   v-model="image"
                 />
               </div>
-              <div class="flex flex-row items-center gap-2">
+              <div
+                class="field-reveal flex flex-row items-center gap-2"
+                v-show="isFieldVisible('logoBackground')"
+              >
                 <label for="with-background">
                   {{ t('With background') }}
                 </label>
                 <input id="with-background" type="checkbox" v-model="includeBackground" />
               </div>
-              <div id="color-settings" :class="'flex w-full flex-row flex-wrap gap-4'">
+              <div
+                id="color-settings"
+                class="field-reveal"
+                :class="'flex w-full flex-row flex-wrap gap-4'"
+                v-show="
+                  isGroupVisible([
+                    'backgroundColor',
+                    'dotsColor',
+                    'cornersSquareColor',
+                    'cornersDotColor'
+                  ])
+                "
+              >
                 <div
+                  v-show="isFieldVisible('backgroundColor')"
                   :inert="!includeBackground"
                   :class="[!includeBackground && 'opacity-30', 'flex flex-row items-center gap-2']"
                 >
@@ -2195,7 +2487,7 @@ const updateDataFromModal = (newData: string) => {
                     v-model="styleBackground"
                   />
                 </div>
-                <div class="flex flex-row items-center gap-2">
+                <div class="flex flex-row items-center gap-2" v-show="isFieldVisible('dotsColor')">
                   <label for="dots-color">{{ t('Dots color') }}</label>
                   <input
                     id="dots-color"
@@ -2204,7 +2496,10 @@ const updateDataFromModal = (newData: string) => {
                     v-model="dotsOptionsColor"
                   />
                 </div>
-                <div class="flex flex-row items-center gap-2">
+                <div
+                  class="flex flex-row items-center gap-2"
+                  v-show="isFieldVisible('cornersSquareColor')"
+                >
                   <label for="corners-square-color">{{ t('Corners Square color') }}</label>
                   <input
                     id="corners-square-color"
@@ -2213,7 +2508,10 @@ const updateDataFromModal = (newData: string) => {
                     v-model="cornersSquareOptionsColor"
                   />
                 </div>
-                <div class="flex flex-row items-center gap-2">
+                <div
+                  class="flex flex-row items-center gap-2"
+                  v-show="isFieldVisible('cornersDotColor')"
+                >
                   <label for="corners-dot-color">{{ t('Corners Dot color') }}</label>
                   <input
                     id="corners-dot-color"
@@ -2223,8 +2521,11 @@ const updateDataFromModal = (newData: string) => {
                   />
                 </div>
               </div>
-              <div class="flex w-full flex-col gap-4 sm:flex-row sm:gap-8">
-                <div class="w-full sm:w-1/3">
+              <div
+                class="field-reveal flex w-full flex-col gap-4 sm:flex-row sm:gap-8"
+                v-show="isGroupVisible(['width', 'height', 'borderRadius'])"
+              >
+                <div class="w-full sm:w-1/3" v-show="isFieldVisible('width')">
                   <label for="width">
                     {{ t('Width (px)') }}
                   </label>
@@ -2236,7 +2537,7 @@ const updateDataFromModal = (newData: string) => {
                     v-model="width"
                   />
                 </div>
-                <div class="w-full sm:w-1/3">
+                <div class="w-full sm:w-1/3" v-show="isFieldVisible('height')">
                   <label for="height">
                     {{ t('Height (px)') }}
                   </label>
@@ -2248,7 +2549,7 @@ const updateDataFromModal = (newData: string) => {
                     v-model="height"
                   />
                 </div>
-                <div class="w-full sm:w-1/3">
+                <div class="w-full sm:w-1/3" v-show="isFieldVisible('borderRadius')">
                   <label for="border-radius">
                     {{ t('Border radius (px)') }}
                   </label>
@@ -2261,8 +2562,11 @@ const updateDataFromModal = (newData: string) => {
                   />
                 </div>
               </div>
-              <div class="flex w-full flex-col gap-4 sm:flex-row sm:gap-8">
-                <div class="w-full sm:w-1/3">
+              <div
+                class="field-reveal flex w-full flex-col gap-4 sm:flex-row sm:gap-8"
+                v-show="isGroupVisible(['margin', 'imageMargin', 'imageSize'])"
+              >
+                <div class="w-full sm:w-1/3" v-show="isFieldVisible('margin')">
                   <label for="margin">
                     {{ t('Margin (px)') }}
                   </label>
@@ -2274,7 +2578,7 @@ const updateDataFromModal = (newData: string) => {
                     v-model="margin"
                   />
                 </div>
-                <div class="w-full sm:w-1/3">
+                <div class="w-full sm:w-1/3" v-show="isFieldVisible('imageMargin')">
                   <label for="image-margin">
                     {{ t('Image margin (px)') }}
                   </label>
@@ -2286,7 +2590,7 @@ const updateDataFromModal = (newData: string) => {
                     v-model="imageMargin"
                   />
                 </div>
-                <div class="w-full sm:w-1/3">
+                <div class="w-full sm:w-1/3" v-show="isFieldVisible('imageSize')">
                   <label for="image-size">
                     {{ t('Image size (ratio)') }}
                   </label>
@@ -2313,9 +2617,17 @@ const updateDataFromModal = (newData: string) => {
               </div>
               <div
                 id="dots-squares-settings"
-                class="mb-4 flex w-full flex-col flex-wrap gap-6 md:flex-row"
+                class="field-reveal mb-4 flex w-full flex-col flex-wrap gap-6 md:flex-row"
+                v-show="
+                  isGroupVisible([
+                    'dotsType',
+                    'cornersSquareType',
+                    'cornersDotType',
+                    'errorCorrectionLevel'
+                  ])
+                "
               >
-                <fieldset class="flex-1">
+                <fieldset class="flex-1" v-show="isFieldVisible('dotsType')">
                   <legend>{{ t('Dots type') }}</legend>
                   <div
                     class="radio"
@@ -2338,7 +2650,7 @@ const updateDataFromModal = (newData: string) => {
                     <label :for="'dotsOptionsType-' + type">{{ t(type) }}</label>
                   </div>
                 </fieldset>
-                <fieldset class="flex-1">
+                <fieldset class="flex-1" v-show="isFieldVisible('cornersSquareType')">
                   <legend>{{ t('Corners Square type') }}</legend>
                   <div
                     class="radio"
@@ -2354,7 +2666,7 @@ const updateDataFromModal = (newData: string) => {
                     <label :for="'cornersSquareOptionsType-' + type">{{ t(type) }}</label>
                   </div>
                 </fieldset>
-                <fieldset class="flex-1">
+                <fieldset class="flex-1" v-show="isFieldVisible('cornersDotType')">
                   <legend>{{ t('Corners Dot type') }}</legend>
                   <div class="radio" v-for="type in ['dot', 'square', 'rounded']" :key="type">
                     <input
@@ -2366,7 +2678,7 @@ const updateDataFromModal = (newData: string) => {
                     <label :for="'cornersDotOptionsType-' + type">{{ t(type) }}</label>
                   </div>
                 </fieldset>
-                <fieldset class="flex-1">
+                <fieldset class="flex-1" v-show="isFieldVisible('errorCorrectionLevel')">
                   <div class="flex flex-row items-center gap-2">
                     <legend>{{ t('Error correction level') }}</legend>
                     <a
@@ -2444,4 +2756,40 @@ const updateDataFromModal = (newData: string) => {
     :ec-level="errorCorrectionLevel"
     @close="isTextExportModalOpen = false"
   />
+
+  <QRSimpleFieldsCustomizer
+    v-model="simpleFields"
+    :open="isCustomizeFieldsOpen"
+    :frame-enabled="showFrame"
+    :is-large="isLarge"
+    @update:open="isCustomizeFieldsOpen = $event"
+    @update:frame-enabled="showFrame = $event"
+  />
 </template>
+
+<style scoped>
+/* When switching between Simple and Full mode we briefly add `.mode-animating`
+   to the settings container; every setting block tagged `.field-reveal` that is
+   currently visible then slides + fades into place, so newly-revealed settings
+   animate in instead of popping. */
+@keyframes field-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.mode-animating .field-reveal {
+  animation: field-slide-in 0.28s ease both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mode-animating .field-reveal {
+    animation: none;
+  }
+}
+</style>
